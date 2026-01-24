@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP, getcontext
+import calendar
+import csv
+
+
+getcontext().prec = 28
+
+INPUT_LOANS_FILE = "loans.csv"
+OUTPUT_EXCEL_FILE = "amortization_schedule.xlsx"
+OUTPUT_FINAL_ROWS_FILE = "amortization_final_rows.xlsx"
+COLUMN_NAME_MAP = {
+    "loan_number": "loan_number",
+    "periods_months": "periods_months",
+    "interest_start_date": "interest_start_date",
+    "first_payment_date": "first_payment_date",
+    "cycle_day": "cycle_day",
+    "annual_rate_percent": "annual_rate_percent",
+    "loan_amount": "loan_amount",
+    "monthly_payment": "monthly_payment",
+}
+
+
+@dataclass
+class ScheduleRow:
+    loan_number: str
+    period: int
+    payment_date: date | None
+    days: int | None
+    beginning_balance: Decimal
+    daily_interest: Decimal | None
+    interest: Decimal | None
+    payment: Decimal | None
+    principal: Decimal | None
+    ending_balance: Decimal
+
+
+def parse_date(value: str) -> date:
+    return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+
+
+def quantize_money(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def add_months(base_date: date, months: int, cycle_day: int) -> date:
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(cycle_day, last_day)
+    return date(year, month, day)
+
+
+def build_schedule(
+    loan_number: str,
+    periods_months: int,
+    interest_start_date: date,
+    first_payment_date: date,
+    cycle_day: int,
+    annual_rate_percent: Decimal,
+    loan_amount: Decimal,
+    monthly_payment: Decimal,
+) -> list[ScheduleRow]:
+    rows: list[ScheduleRow] = []
+    balance = quantize_money(loan_amount)
+
+    rows.append(
+        ScheduleRow(
+            loan_number=loan_number,
+            period=0,
+            payment_date=interest_start_date,
+            days=None,
+            beginning_balance=balance,
+            daily_interest=None,
+            interest=None,
+            payment=None,
+            principal=None,
+            ending_balance=balance,
+        )
+    )
+
+    previous_date = interest_start_date
+    for period in range(1, periods_months + 1):
+        if period == 1:
+            payment_date = first_payment_date
+        else:
+            payment_date = add_months(first_payment_date, period - 1, cycle_day)
+
+        days = (payment_date - previous_date).days
+        daily_interest = quantize_money(
+            (annual_rate_percent / Decimal(100)) * balance / Decimal(365)
+        )
+        interest = quantize_money(daily_interest * Decimal(days))
+
+        payment = monthly_payment
+        if period == periods_months:
+            payment = balance + interest
+        elif payment > balance + interest:
+            payment = balance + interest
+
+        principal = payment - interest
+        ending_balance = quantize_money(balance - principal)
+        if ending_balance < Decimal("0.00"):
+            ending_balance = Decimal("0.00")
+
+        rows.append(
+            ScheduleRow(
+                loan_number=loan_number,
+                period=period,
+                payment_date=payment_date,
+                days=days,
+                beginning_balance=balance,
+                daily_interest=daily_interest,
+                interest=interest,
+                payment=payment,
+                principal=principal,
+                ending_balance=ending_balance,
+            )
+        )
+
+        balance = ending_balance
+        previous_date = payment_date
+
+    return rows
+
+
+def format_money(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:,.2f}"
+
+
+def display_schedule(rows: list[ScheduleRow]) -> None:
+    headers = [
+        "Loan #",
+        "Period",
+        "Payment Date",
+        "Days",
+        "Begin Balance",
+        "Daily Interest",
+        "Interest",
+        "Payment",
+        "Principal",
+        "End Balance",
+    ]
+    widths = [8, 6, 12, 6, 14, 14, 12, 12, 12, 14]
+    header_row = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+    print(header_row)
+    print("-" * len(header_row))
+
+    for row in rows:
+        values = [
+            row.loan_number,
+            str(row.period),
+            row.payment_date.isoformat() if row.payment_date else "",
+            "" if row.days is None else str(row.days),
+            format_money(row.beginning_balance),
+            format_money(row.daily_interest),
+            format_money(row.interest),
+            format_money(row.payment),
+            format_money(row.principal),
+            format_money(row.ending_balance),
+        ]
+        line = "  ".join(v.ljust(w) for v, w in zip(values, widths))
+        print(line)
+
+
+def load_loans(file_path: str, column_map: dict[str, str]) -> list[dict[str, object]]:
+    loans: list[dict[str, object]] = []
+    with open(file_path, newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            def value(key: str) -> str:
+                return row[column_map[key]]
+
+            loans.append(
+                {
+                    "loan_number": value("loan_number"),
+                    "periods_months": int(value("periods_months")),
+                    "interest_start_date": parse_date(value("interest_start_date")),
+                    "first_payment_date": parse_date(value("first_payment_date")),
+                    "cycle_day": int(value("cycle_day")),
+                    "annual_rate_percent": Decimal(value("annual_rate_percent")),
+                    "loan_amount": Decimal(value("loan_amount")),
+                    "monthly_payment": Decimal(value("monthly_payment")),
+                }
+            )
+    return loans
+
+
+def export_schedule_excel(rows: list[ScheduleRow], file_path: str) -> None:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import numbers
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "openpyxl is required to export Excel files. Install with: pip install openpyxl"
+        ) from exc
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Amortization"
+
+    headers = [
+        "Loan #",
+        "Period",
+        "Payment Date",
+        "Days",
+        "Begin Balance",
+        "Daily Interest",
+        "Interest",
+        "Payment",
+        "Principal",
+        "End Balance",
+    ]
+    sheet.append(headers)
+
+    for row in rows:
+        sheet.append(
+            [
+                row.loan_number,
+                row.period,
+                row.payment_date,
+                row.days,
+                float(row.beginning_balance) if row.beginning_balance is not None else None,
+                float(row.daily_interest) if row.daily_interest is not None else None,
+                float(row.interest) if row.interest is not None else None,
+                float(row.payment) if row.payment is not None else None,
+                float(row.principal) if row.principal is not None else None,
+                float(row.ending_balance) if row.ending_balance is not None else None,
+            ]
+        )
+
+    for cell in sheet["C"][1:]:
+        cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
+
+    for column in ["E", "F", "G", "H", "I", "J"]:
+        for cell in sheet[column][1:]:
+            cell.number_format = numbers.FORMAT_NUMBER_00
+
+    workbook.save(file_path)
+
+
+def export_final_rows_excel(rows: list[ScheduleRow], file_path: str) -> None:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import numbers
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "openpyxl is required to export Excel files. Install with: pip install openpyxl"
+        ) from exc
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Final Rows"
+
+    headers = [
+        "Loan #",
+        "Period",
+        "Payment Date",
+        "Days",
+        "Begin Balance",
+        "Daily Interest",
+        "Interest",
+        "Payment",
+        "Principal",
+        "End Balance",
+    ]
+    sheet.append(headers)
+
+    final_by_loan: dict[str, ScheduleRow] = {}
+    for row in rows:
+        final_by_loan[row.loan_number] = row
+
+    for row in final_by_loan.values():
+        sheet.append(
+            [
+                row.loan_number,
+                row.period,
+                row.payment_date,
+                row.days,
+                float(row.beginning_balance) if row.beginning_balance is not None else None,
+                float(row.daily_interest) if row.daily_interest is not None else None,
+                float(row.interest) if row.interest is not None else None,
+                float(row.payment) if row.payment is not None else None,
+                float(row.principal) if row.principal is not None else None,
+                float(row.ending_balance) if row.ending_balance is not None else None,
+            ]
+        )
+
+    for cell in sheet["C"][1:]:
+        cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
+
+    for column in ["E", "F", "G", "H", "I", "J"]:
+        for cell in sheet[column][1:]:
+            cell.number_format = numbers.FORMAT_NUMBER_00
+
+    workbook.save(file_path)
+
+
+def main() -> None:
+    loans = load_loans(INPUT_LOANS_FILE, COLUMN_NAME_MAP)
+    all_rows: list[ScheduleRow] = []
+    for loan in loans:
+        rows = build_schedule(
+            loan_number=loan["loan_number"],
+            periods_months=loan["periods_months"],
+            interest_start_date=loan["interest_start_date"],
+            first_payment_date=loan["first_payment_date"],
+            cycle_day=loan["cycle_day"],
+            annual_rate_percent=loan["annual_rate_percent"],
+            loan_amount=loan["loan_amount"],
+            monthly_payment=loan["monthly_payment"],
+        )
+        all_rows.extend(rows)
+
+    display_schedule(all_rows)
+    export_schedule_excel(all_rows, OUTPUT_EXCEL_FILE)
+    print(f"Excel file saved to {OUTPUT_EXCEL_FILE}")
+    export_final_rows_excel(all_rows, OUTPUT_FINAL_ROWS_FILE)
+    print(f"Excel file saved to {OUTPUT_FINAL_ROWS_FILE}")
+
+
+if __name__ == "__main__":
+    main()
