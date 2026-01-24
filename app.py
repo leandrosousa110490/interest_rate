@@ -16,6 +16,7 @@ OUTPUT_FINAL_ROWS_FILE = "amortization_final_rows.xlsx"
 COLUMN_NAME_MAP = {
     "loan_number": "loan_number",
     "periods_months": "periods_months",
+    "projected_close_date": "projected_close_date",
     "interest_start_date": "interest_start_date",
     "first_payment_date": "first_payment_date",
     "cycle_day": "cycle_day",
@@ -31,16 +32,24 @@ class ScheduleRow:
     period: int
     payment_date: date | None
     days: int | None
+    projected_close_date: date | None
     beginning_balance: Decimal
     daily_interest: Decimal | None
     interest: Decimal | None
     payment: Decimal | None
     principal: Decimal | None
+    extra_interest: Decimal | None
     ending_balance: Decimal
 
 
 def parse_date(value: str) -> date:
-    return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    value = value.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported date format: {value}")
 
 
 def quantize_money(value: Decimal) -> Decimal:
@@ -59,6 +68,7 @@ def add_months(base_date: date, months: int, cycle_day: int) -> date:
 def build_schedule(
     loan_number: str,
     periods_months: int,
+    projected_close_date: date | None,
     interest_start_date: date,
     first_payment_date: date,
     cycle_day: int,
@@ -75,14 +85,27 @@ def build_schedule(
             period=0,
             payment_date=interest_start_date,
             days=None,
+            projected_close_date=projected_close_date,
             beginning_balance=balance,
             daily_interest=None,
             interest=None,
             payment=None,
             principal=None,
+            extra_interest=None,
             ending_balance=balance,
         )
     )
+
+    extra_interest: Decimal | None = None
+    if projected_close_date:
+        extra_days = (interest_start_date - projected_close_date).days
+        if extra_days < 0:
+            extra_days = 0
+        extra_daily_interest = quantize_money(
+            (annual_rate_percent / Decimal(100)) * balance / Decimal(365)
+        )
+        extra_interest = quantize_money(extra_daily_interest * Decimal(extra_days))
+        rows[0].extra_interest = extra_interest
 
     previous_date = interest_start_date
     for period in range(1, periods_months + 1):
@@ -96,8 +119,12 @@ def build_schedule(
             (annual_rate_percent / Decimal(100)) * balance / Decimal(365)
         )
         interest = quantize_money(daily_interest * Decimal(days))
+        if period == 1 and extra_interest is not None:
+            interest = quantize_money(interest + extra_interest)
 
         payment = monthly_payment
+        if period == 1 and extra_interest is not None:
+            payment = payment + extra_interest
         if period == periods_months:
             payment = balance + interest
         elif payment > balance + interest:
@@ -114,11 +141,13 @@ def build_schedule(
                 period=period,
                 payment_date=payment_date,
                 days=days,
+                projected_close_date=None,
                 beginning_balance=balance,
                 daily_interest=daily_interest,
                 interest=interest,
                 payment=payment,
                 principal=principal,
+                extra_interest=None,
                 ending_balance=ending_balance,
             )
         )
@@ -141,14 +170,16 @@ def display_schedule(rows: list[ScheduleRow]) -> None:
         "Period",
         "Payment Date",
         "Days",
+        "Projected Close Date",
         "Begin Balance",
         "Daily Interest",
         "Interest",
         "Payment",
         "Principal",
+        "Extra Interest",
         "End Balance",
     ]
-    widths = [8, 6, 12, 6, 14, 14, 12, 12, 12, 14]
+    widths = [8, 6, 12, 6, 18, 14, 14, 12, 12, 12, 14, 14]
     header_row = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
     print(header_row)
     print("-" * len(header_row))
@@ -159,11 +190,13 @@ def display_schedule(rows: list[ScheduleRow]) -> None:
             str(row.period),
             row.payment_date.isoformat() if row.payment_date else "",
             "" if row.days is None else str(row.days),
+            row.projected_close_date.isoformat() if row.projected_close_date else "",
             format_money(row.beginning_balance),
             format_money(row.daily_interest),
             format_money(row.interest),
             format_money(row.payment),
             format_money(row.principal),
+            format_money(row.extra_interest),
             format_money(row.ending_balance),
         ]
         line = "  ".join(v.ljust(w) for v, w in zip(values, widths))
@@ -216,6 +249,9 @@ def load_loans(
             {
                 "loan_number": as_text(cell_value(row_values, "loan_number")),
                 "periods_months": int(as_text(cell_value(row_values, "periods_months"))),
+                "projected_close_date": parse_date(
+                    as_text(cell_value(row_values, "projected_close_date"))
+                ),
                 "interest_start_date": parse_date(
                     as_text(cell_value(row_values, "interest_start_date"))
                 ),
@@ -253,11 +289,13 @@ def export_schedule_excel(rows: list[ScheduleRow], file_path: str) -> None:
         "Period",
         "Payment Date",
         "Days",
+        "Projected Close Date",
         "Begin Balance",
         "Daily Interest",
         "Interest",
         "Payment",
         "Principal",
+        "Extra Interest",
         "End Balance",
     ]
     sheet.append(headers)
@@ -269,11 +307,13 @@ def export_schedule_excel(rows: list[ScheduleRow], file_path: str) -> None:
                 row.period,
                 row.payment_date,
                 row.days,
+                row.projected_close_date,
                 float(row.beginning_balance) if row.beginning_balance is not None else None,
                 float(row.daily_interest) if row.daily_interest is not None else None,
                 float(row.interest) if row.interest is not None else None,
                 float(row.payment) if row.payment is not None else None,
                 float(row.principal) if row.principal is not None else None,
+                float(row.extra_interest) if row.extra_interest is not None else None,
                 float(row.ending_balance) if row.ending_balance is not None else None,
             ]
         )
@@ -284,7 +324,10 @@ def export_schedule_excel(rows: list[ScheduleRow], file_path: str) -> None:
     for cell in sheet["C"][1:]:
         cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
 
-    for column in ["E", "F", "G", "H", "I", "J"]:
+    for cell in sheet["E"][1:]:
+        cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
+
+    for column in ["F", "G", "H", "I", "J", "K", "L"]:
         for cell in sheet[column][1:]:
             cell.number_format = numbers.FORMAT_NUMBER_00
 
@@ -306,45 +349,80 @@ def export_final_rows_excel(rows: list[ScheduleRow], file_path: str) -> None:
 
     headers = [
         "Loan #",
-        "Period",
-        "Payment Date",
-        "Days",
-        "Begin Balance",
-        "Daily Interest",
-        "Interest",
-        "Payment",
-        "Principal",
-        "End Balance",
+        "First Payment Date",
+        "First Payment Days",
+        "Projected Close Date",
+        "First Begin Balance",
+        "First Daily Interest",
+        "First Interest",
+        "First Payment",
+        "First Principal",
+        "First Extra Interest",
+        "First End Balance",
+        "Final Payment Date",
+        "Final Payment Days",
+        "Final Begin Balance",
+        "Final Daily Interest",
+        "Final Interest",
+        "Final Payment",
+        "Final Principal",
+        "Final Extra Interest",
+        "Final End Balance",
     ]
     sheet.append(headers)
 
+    first_payment_by_loan: dict[str, ScheduleRow] = {}
     final_by_loan: dict[str, ScheduleRow] = {}
     for row in rows:
         final_by_loan[row.loan_number] = row
+        if row.period == 1 and row.loan_number not in first_payment_by_loan:
+            first_payment_by_loan[row.loan_number] = row
 
-    for row in final_by_loan.values():
+    def to_float(value: Decimal | None) -> float | None:
+        if value is None:
+            return None
+        return float(value)
+
+    for loan_number, final_row in final_by_loan.items():
+        first_row = first_payment_by_loan.get(loan_number)
         sheet.append(
             [
-                row.loan_number,
-                row.period,
-                row.payment_date,
-                row.days,
-                float(row.beginning_balance) if row.beginning_balance is not None else None,
-                float(row.daily_interest) if row.daily_interest is not None else None,
-                float(row.interest) if row.interest is not None else None,
-                float(row.payment) if row.payment is not None else None,
-                float(row.principal) if row.principal is not None else None,
-                float(row.ending_balance) if row.ending_balance is not None else None,
+                loan_number,
+                first_row.payment_date if first_row else None,
+                first_row.days if first_row else None,
+                first_row.projected_close_date if first_row else None,
+                to_float(first_row.beginning_balance) if first_row else None,
+                to_float(first_row.daily_interest) if first_row else None,
+                to_float(first_row.interest) if first_row else None,
+                to_float(first_row.payment) if first_row else None,
+                to_float(first_row.principal) if first_row else None,
+                to_float(first_row.extra_interest) if first_row else None,
+                to_float(first_row.ending_balance) if first_row else None,
+                final_row.payment_date if final_row else None,
+                final_row.days if final_row else None,
+                to_float(final_row.beginning_balance) if final_row else None,
+                to_float(final_row.daily_interest) if final_row else None,
+                to_float(final_row.interest) if final_row else None,
+                to_float(final_row.payment) if final_row else None,
+                to_float(final_row.principal) if final_row else None,
+                to_float(final_row.extra_interest) if final_row else None,
+                to_float(final_row.ending_balance) if final_row else None,
             ]
         )
 
     for cell in sheet["A"][1:]:
         cell.number_format = numbers.FORMAT_TEXT
 
-    for cell in sheet["C"][1:]:
+    for cell in sheet["B"][1:]:
         cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
 
-    for column in ["E", "F", "G", "H", "I", "J"]:
+    for cell in sheet["D"][1:]:
+        cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
+
+    for cell in sheet["L"][1:]:
+        cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
+
+    for column in ["E", "F", "G", "H", "I", "J", "K", "N", "O", "P", "Q", "R", "S", "T"]:
         for cell in sheet[column][1:]:
             cell.number_format = numbers.FORMAT_NUMBER_00
 
@@ -358,6 +436,7 @@ def main() -> None:
         rows = build_schedule(
             loan_number=loan["loan_number"],
             periods_months=loan["periods_months"],
+            projected_close_date=loan["projected_close_date"],
             interest_start_date=loan["interest_start_date"],
             first_payment_date=loan["first_payment_date"],
             cycle_day=loan["cycle_day"],
