@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 import calendar
-import csv
+from zipfile import BadZipFile
 
 
 getcontext().prec = 28
 
-INPUT_LOANS_FILE = "loans.csv"
+INPUT_LOANS_FILE = "loans.xlsx"
+INPUT_SHEET_NAME = "Sheet1"
 OUTPUT_EXCEL_FILE = "amortization_schedule.xlsx"
 OUTPUT_FINAL_ROWS_FILE = "amortization_final_rows.xlsx"
 COLUMN_NAME_MAP = {
@@ -169,26 +170,68 @@ def display_schedule(rows: list[ScheduleRow]) -> None:
         print(line)
 
 
-def load_loans(file_path: str, column_map: dict[str, str]) -> list[dict[str, object]]:
-    loans: list[dict[str, object]] = []
-    with open(file_path, newline="", encoding="utf-8") as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            def value(key: str) -> str:
-                return row[column_map[key]]
+def load_loans(
+    file_path: str, sheet_name: str, column_map: dict[str, str]
+) -> list[dict[str, object]]:
+    try:
+        from openpyxl import load_workbook
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "openpyxl is required to read Excel files. Install with: pip install openpyxl"
+        ) from exc
 
-            loans.append(
-                {
-                    "loan_number": value("loan_number"),
-                    "periods_months": int(value("periods_months")),
-                    "interest_start_date": parse_date(value("interest_start_date")),
-                    "first_payment_date": parse_date(value("first_payment_date")),
-                    "cycle_day": int(value("cycle_day")),
-                    "annual_rate_percent": Decimal(value("annual_rate_percent")),
-                    "loan_amount": Decimal(value("loan_amount")),
-                    "monthly_payment": Decimal(value("monthly_payment")),
-                }
-            )
+    lower_path = file_path.lower()
+    if not (lower_path.endswith(".xlsx") or lower_path.endswith(".xlsm")):
+        raise ValueError("Input file must be an .xlsx or .xlsm Excel file.")
+
+    try:
+        workbook = load_workbook(file_path, read_only=True, data_only=True)
+    except BadZipFile as exc:
+        raise ValueError("Input file is not a valid Excel workbook.") from exc
+
+    sheet = workbook[sheet_name]
+    rows_iter = sheet.iter_rows(values_only=True)
+    header_row = next(rows_iter, None)
+    if header_row is None:
+        return []
+
+    headers = [str(value).strip() if value is not None else "" for value in header_row]
+    header_index = {name: idx for idx, name in enumerate(headers)}
+
+    def cell_value(row_values: tuple[object, ...], key: str) -> object:
+        column_name = column_map[key]
+        index = header_index[column_name]
+        return row_values[index]
+
+    loans: list[dict[str, object]] = []
+    for row_values in rows_iter:
+        def as_text(value: object) -> str:
+            if isinstance(value, datetime):
+                return value.date().isoformat()
+            if isinstance(value, date):
+                return value.isoformat()
+            return str(value).strip()
+
+        loans.append(
+            {
+                "loan_number": as_text(cell_value(row_values, "loan_number")),
+                "periods_months": int(as_text(cell_value(row_values, "periods_months"))),
+                "interest_start_date": parse_date(
+                    as_text(cell_value(row_values, "interest_start_date"))
+                ),
+                "first_payment_date": parse_date(
+                    as_text(cell_value(row_values, "first_payment_date"))
+                ),
+                "cycle_day": int(as_text(cell_value(row_values, "cycle_day"))),
+                "annual_rate_percent": Decimal(
+                    as_text(cell_value(row_values, "annual_rate_percent"))
+                ),
+                "loan_amount": Decimal(as_text(cell_value(row_values, "loan_amount"))),
+                "monthly_payment": Decimal(
+                    as_text(cell_value(row_values, "monthly_payment"))
+                ),
+            }
+        )
     return loans
 
 
@@ -234,6 +277,9 @@ def export_schedule_excel(rows: list[ScheduleRow], file_path: str) -> None:
                 float(row.ending_balance) if row.ending_balance is not None else None,
             ]
         )
+
+    for cell in sheet["A"][1:]:
+        cell.number_format = numbers.FORMAT_TEXT
 
     for cell in sheet["C"][1:]:
         cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
@@ -292,6 +338,9 @@ def export_final_rows_excel(rows: list[ScheduleRow], file_path: str) -> None:
             ]
         )
 
+    for cell in sheet["A"][1:]:
+        cell.number_format = numbers.FORMAT_TEXT
+
     for cell in sheet["C"][1:]:
         cell.number_format = numbers.FORMAT_DATE_YYYYMMDD2
 
@@ -303,7 +352,7 @@ def export_final_rows_excel(rows: list[ScheduleRow], file_path: str) -> None:
 
 
 def main() -> None:
-    loans = load_loans(INPUT_LOANS_FILE, COLUMN_NAME_MAP)
+    loans = load_loans(INPUT_LOANS_FILE, INPUT_SHEET_NAME, COLUMN_NAME_MAP)
     all_rows: list[ScheduleRow] = []
     for loan in loans:
         rows = build_schedule(
