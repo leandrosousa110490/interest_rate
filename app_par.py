@@ -13,6 +13,7 @@ INPUT_LOANS_FILE = "loans.xlsx"
 INPUT_SHEET_NAME = "Sheet1"
 OUTPUT_PARQUET_FILE = "amortization_schedule.parquet"
 OUTPUT_FINAL_ROWS_FILE = "amortization_final_rows.xlsx"
+OUTPUT_FINAL_ROWS_PARQUET_FILE = "amortization_final_rows.parquet"
 COLUMN_NAME_MAP = {
     "loan_number": "loan_number",
     "periods_months": "periods_months",
@@ -364,6 +365,88 @@ def export_final_rows_excel(rows: list[ScheduleRow], file_path: str) -> None:
     workbook.save(file_path)
 
 
+def export_final_rows_parquet(rows: list[ScheduleRow], file_path: str) -> None:
+    try:
+        import pandas as pd
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "pandas is required to export Parquet files. Install with: pip install pandas pyarrow"
+        ) from exc
+
+    first_payment_by_loan: dict[str, ScheduleRow] = {}
+    final_by_loan: dict[str, ScheduleRow] = {}
+    total_interest_by_loan: dict[str, Decimal] = {}
+    
+    for row in rows:
+        final_by_loan[row.loan_number] = row
+        if row.period == 1 and row.loan_number not in first_payment_by_loan:
+            first_payment_by_loan[row.loan_number] = row
+        
+        # Calculate total interest paid (sum interest from all payment periods, excluding period 0)
+        if row.period > 0 and row.interest is not None:
+            if row.loan_number not in total_interest_by_loan:
+                total_interest_by_loan[row.loan_number] = Decimal("0.00")
+            total_interest_by_loan[row.loan_number] += row.interest
+
+    def to_float(value: Decimal | None) -> float | None:
+        if value is None:
+            return None
+        return float(value)
+
+    data = {
+        "loan_number": [],
+        "first_payment_date": [],
+        "first_payment_days": [],
+        "projected_close_date": [],
+        "first_begin_balance": [],
+        "first_daily_interest": [],
+        "first_interest": [],
+        "first_payment": [],
+        "first_principal": [],
+        "first_extra_interest": [],
+        "first_end_balance": [],
+        "final_payment_date": [],
+        "final_payment_days": [],
+        "final_begin_balance": [],
+        "final_daily_interest": [],
+        "final_interest": [],
+        "final_payment": [],
+        "final_principal": [],
+        "final_extra_interest": [],
+        "final_end_balance": [],
+        "total_interest_paid": [],
+    }
+
+    for loan_number, final_row in final_by_loan.items():
+        first_row = first_payment_by_loan.get(loan_number)
+        total_interest = total_interest_by_loan.get(loan_number, Decimal("0.00"))
+        
+        data["loan_number"].append(loan_number)
+        data["first_payment_date"].append(first_row.payment_date if first_row else None)
+        data["first_payment_days"].append(first_row.days if first_row else None)
+        data["projected_close_date"].append(first_row.projected_close_date if first_row else None)
+        data["first_begin_balance"].append(to_float(first_row.beginning_balance) if first_row else None)
+        data["first_daily_interest"].append(to_float(first_row.daily_interest) if first_row else None)
+        data["first_interest"].append(to_float(first_row.interest) if first_row else None)
+        data["first_payment"].append(to_float(first_row.payment) if first_row else None)
+        data["first_principal"].append(to_float(first_row.principal) if first_row else None)
+        data["first_extra_interest"].append(to_float(first_row.extra_interest) if first_row else None)
+        data["first_end_balance"].append(to_float(first_row.ending_balance) if first_row else None)
+        data["final_payment_date"].append(final_row.payment_date if final_row else None)
+        data["final_payment_days"].append(final_row.days if final_row else None)
+        data["final_begin_balance"].append(to_float(final_row.beginning_balance) if final_row else None)
+        data["final_daily_interest"].append(to_float(final_row.daily_interest) if final_row else None)
+        data["final_interest"].append(to_float(final_row.interest) if final_row else None)
+        data["final_payment"].append(to_float(final_row.payment) if final_row else None)
+        data["final_principal"].append(to_float(final_row.principal) if final_row else None)
+        data["final_extra_interest"].append(to_float(final_row.extra_interest) if final_row else None)
+        data["final_end_balance"].append(to_float(final_row.ending_balance) if final_row else None)
+        data["total_interest_paid"].append(to_float(total_interest))
+
+    df = pd.DataFrame(data)
+    df.to_parquet(file_path, index=False)
+
+
 def main() -> None:
     loans = load_loans(INPUT_LOANS_FILE, INPUT_SHEET_NAME, COLUMN_NAME_MAP)
     all_rows: list[ScheduleRow] = []
@@ -386,6 +469,8 @@ def main() -> None:
     print(f"Parquet file saved to {OUTPUT_PARQUET_FILE}")
     export_final_rows_excel(all_rows, OUTPUT_FINAL_ROWS_FILE)
     print(f"Excel file saved to {OUTPUT_FINAL_ROWS_FILE}")
+    export_final_rows_parquet(all_rows, OUTPUT_FINAL_ROWS_PARQUET_FILE)
+    print(f"Parquet file saved to {OUTPUT_FINAL_ROWS_PARQUET_FILE}")
 
 
 if __name__ == "__main__":
